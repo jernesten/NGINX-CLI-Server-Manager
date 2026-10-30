@@ -1,0 +1,705 @@
+#!/bin/bash
+
+# Colores para output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+NC='\033[0m' # No Color
+
+# Variables de configuración
+MYSQL_ROOT_PASS=""
+JOOMLA_VERSION="5.3.0"  # Puedes actualizar esto
+
+# Función para mostrar ayuda
+show_help() {
+    echo -e "${CYAN}=== SCRIPT DE GESTIÓN DE SERVIDORES NGINX ===${NC}"
+    echo ""
+    echo -e "${WHITE}USO:${NC}"
+    echo "  servers [OPCIÓN] [NOMBRE_SERVIDOR]"
+    echo ""
+    echo -e "${WHITE}OPCIONES:${NC}"
+    echo -e "  ${GREEN}Sin argumentos${NC}     Listar todos los servidores disponibles"
+    echo -e "  ${GREEN}-n${NC}                 Crear un nuevo servidor (modo interactivo)"
+    echo -e "  ${GREEN}-l${NC}                 Listar servidores (igual que sin argumentos)"
+    echo -e "  ${GREEN}-e <nombre>${NC}        Habilitar un servidor"
+    echo -e "  ${GREEN}-d <nombre>${NC}        Deshabilitar un servidor"
+    echo -e "  ${GREEN}-rm <nombre>${NC}       Borrar un servidor completamente"
+    echo -e "  ${GREEN}-h${NC}                 Mostrar esta ayuda"
+    echo ""
+    echo -e "${WHITE}EJEMPLOS:${NC}"
+    echo "  servers                   # Listar servidores"
+    echo "  servers -n                # Crear nuevo servidor"
+    echo "  servers -e misitio.com    # Habilitar misitio.com"
+    echo "  servers -d misitio.com    # Deshabilitar misitio.com"
+    echo "  servers -rm misitio.com   # Borrar misitio.com"
+    echo ""
+}
+
+# Función para generar contraseña aleatoria
+generate_password() {
+    openssl rand -base64 12 | tr -d "=+/" | cut -c1-16
+}
+
+# Función para obtener contraseña de root MySQL
+get_mysql_root_pass() {
+    if [ -z "$MYSQL_ROOT_PASS" ]; then
+        echo -e "${YELLOW}⚠️  Necesito la contraseña de root de MySQL${NC}"
+        read -sp "Contraseña de root MySQL: " MYSQL_ROOT_PASS
+        echo ""
+        
+        # Probar conexión
+        if ! mysql -u root -p"$MYSQL_ROOT_PASS" -e "SELECT 1" &>/dev/null; then
+            echo -e "${RED}❌ Contraseña incorrecta. Inténtalo de nuevo.${NC}"
+            MYSQL_ROOT_PASS=""
+            get_mysql_root_pass
+        fi
+    fi
+}
+
+# Función para crear un servidor simple
+create_simple_server() {
+    local server_name=$1
+    local port=$2
+    
+    echo -e "${CYAN}=== CREANDO SERVIDOR SIMPLE ===${NC}"
+    
+    # Crear archivo de configuración del servidor
+    config_file="/etc/nginx/sites-available/$server_name"
+    sudo bash -c "cat > $config_file" <<EOL
+server {
+    listen $port;
+    server_name $server_name;
+
+    root /var/www/html/$server_name;
+    index index.html index.htm;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+EOL
+
+    # Crear directorio raíz para el server
+    sudo mkdir -p /var/www/html/$server_name
+
+    # Crear archivo index.html
+    sudo bash -c "cat > /var/www/html/$server_name/index.html" <<EOL
+<!DOCTYPE html>
+<html>
+<head>
+  <title>$server_name</title>
+  <meta charset="utf-8">
+  <meta name="robots" content="noindex,nofollow">
+  <link href="https://fonts.googleapis.com/css?family=Press+Start+2P&display=swap" rel="stylesheet">
+  <style>
+    body, html {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      min-height: 100%;
+      background-image: url('https://show.home.lan/media/img/bg.jpg');
+      background-size: cover;
+      background-position: center;
+      background-repeat: no-repeat;
+      background-attachment: fixed;
+      font-family: 'Press Start 2P', 'Courier New', monospace;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    h1 {
+      text-align: center;
+      color: #02c302;
+      font-size: 24px;
+      text-shadow: 0 0 45px #000, 0 0 19px #000, 0 0 25px #0f0;
+      margin: 15% 0 20px 0;
+      padding: 0 20px;
+      line-height: 1.4;
+      animation: glow 2s ease-in-out infinite;
+      position: relative;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <div class="overlay"></div>
+  <h1>${server_name^^}</h1>
+</body>
+</html>
+EOL
+
+    echo -e "${GREEN}✓ Servidor simple $server_name creado${NC}"
+}
+
+# Función para crear base de datos y usuario para Joomla
+create_joomla_database() {
+    local server_name=$1
+    local db_name="${server_name%.*}"  # Elimina .lan, .com, etc.
+    db_name=$(echo "$db_name" | tr '-' '_' | tr '.' '_')  # Reemplaza caracteres no válidos
+    
+    local db_user="${db_name}_user"
+    local db_password=$(generate_password)
+    
+    echo -e "${CYAN}=== CONFIGURANDO BASE DE DATOS ===${NC}"
+    
+    # Obtener contraseña de root
+    get_mysql_root_pass
+    
+    # Crear base de datos y usuario
+    mysql -u root -p"$MYSQL_ROOT_PASS" <<EOF
+-- Crear base de datos
+CREATE DATABASE IF NOT EXISTS \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- Crear usuario
+CREATE USER IF NOT EXISTS '$db_user'@'localhost' IDENTIFIED BY '$db_password';
+
+-- Otorgar todos los privilegios
+GRANT ALL PRIVILEGES ON \`$db_name\`.* TO '$db_user'@'localhost';
+
+-- Aplicar cambios
+FLUSH PRIVILEGES;
+EOF
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✓ Base de datos creada: $db_name${NC}"
+        echo -e "${GREEN}✓ Usuario creado: $db_user${NC}"
+        
+        # Guardar credenciales en archivo dentro del sitio
+        sudo bash -c "cat > /var/www/html/$server_name/db_credentials.txt" <<EOL
+==========================================
+CREDENCIALES DE BASE DE DATOS PARA JOOMLA
+==========================================
+Base de datos: $db_name
+Usuario: $db_user
+Contraseña: $db_password
+Host: localhost
+==========================================
+GUARDA ESTAS CREDENCIALES EN UN LUGAR SEGURO
+==========================================
+EOL
+        sudo chmod 600 /var/www/html/$server_name/db_credentials.txt
+        
+        # Exportar para usar en otras funciones
+        export JOOMLA_DB_NAME="$db_name"
+        export JOOMLA_DB_USER="$db_user"
+        export JOOMLA_DB_PASS="$db_password"
+        
+        return 0
+    else
+        echo -e "${RED}❌ Error al crear la base de datos${NC}"
+        return 1
+    fi
+}
+
+# Función para descargar e instalar Joomla
+install_joomla() {
+    local server_name=$1
+    
+    echo -e "${CYAN}=== DESCARGANDO JOOMLA ===${NC}"
+    
+    local temp_dir="/tmp/joomla_$server_name"
+    local install_dir="/var/www/html/$server_name"
+    
+    # Crear directorio temporal
+    mkdir -p "$temp_dir"
+    cd "$temp_dir" || return 1
+    
+    # Descargar Joomla
+    echo -e "${YELLOW}Descargando Joomla $JOOMLA_VERSION...${NC}"
+    wget -q "https://downloads.joomla.org/cms/joomla5/${JOOMLA_VERSION}/Joomla_${JOOMLA_VERSION}-Stable-Full_Package.zip" -O joomla.zip
+    
+    if [ $? -ne 0 ]; then
+        echo -e "${YELLOW}⚠️  No se pudo descargar la versión específica. Descargando la última estable...${NC}"
+        wget -q "https://downloads.joomla.org/latest.zip" -O joomla.zip
+    fi
+    
+    if [ ! -f "joomla.zip" ] || [ ! -s "joomla.zip" ]; then
+        echo -e "${RED}❌ Error al descargar Joomla${NC}"
+        return 1
+    fi
+    
+    # Descomprimir Joomla
+    echo -e "${YELLOW}Instalando Joomla en $install_dir...${NC}"
+    sudo unzip -q joomla.zip -d "$install_dir"
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✓ Joomla instalado correctamente${NC}"
+    else
+        echo -e "${RED}❌ Error al descomprimir Joomla${NC}"
+        return 1
+    fi
+    
+    # Limpiar directorio temporal
+    cd /tmp
+    rm -rf "$temp_dir"
+    
+    return 0
+}
+
+# Función para configurar permisos de Joomla
+setup_joomla_permissions() {
+    local server_name=$1
+    local install_dir="/var/www/html/$server_name"
+    
+    echo -e "${CYAN}=== CONFIGURANDO PERMISOS ===${NC}"
+    
+    # Cambiar propietario a www-data
+    sudo chown -R www-data:www-data "$install_dir"
+    
+    # Configurar permisos básicos
+    sudo find "$install_dir" -type f -exec chmod 644 {} \;
+    sudo find "$install_dir" -type d -exec chmod 755 {} \;
+    
+    # Directorios con permisos de escritura
+    sudo chmod 775 "$install_dir"
+    sudo chmod -R 775 "$install_dir"/{cache,logs,tmp,images,media,administrator/components,administrator/modules,administrator/templates} 2>/dev/null
+    
+    # Crear archivo configuration.php
+    sudo touch "$install_dir/configuration.php"
+    sudo chmod 666 "$install_dir/configuration.php"
+    
+    echo -e "${GREEN}✓ Permisos configurados correctamente${NC}"
+}
+
+# Función para crear un servidor Joomla
+create_joomla_server() {
+    local server_name=$1
+    local port=$2
+    
+    echo -e "${CYAN}=== CREANDO SERVIDOR JOOMLA ===${NC}"
+    
+    # Crear archivo de configuración del servidor
+    config_file="/etc/nginx/sites-available/$server_name"
+    sudo bash -c "cat > $config_file" <<EOL
+server {
+    listen $port;
+    server_name $server_name;
+
+    root /var/www/html/$server_name;
+    index index.php index.html index.htm;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$args;
+    }
+
+    location /api/ {
+        try_files \$uri \$uri/ /api/index.php?\$args;
+    }
+
+    location ~* /(images|cache|media|logs|tmp)/.*\.(php|pl|py|jsp|asp|sh|cgi)$ {
+        return 403;
+    }
+
+    location ~ \.php$ {
+        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include /etc/nginx/fastcgi.conf;
+        
+        # Configuración adicional para Joomla
+        fastcgi_buffers 16 16k;
+        fastcgi_buffer_size 32k;
+        fastcgi_read_timeout 300;
+    }
+}
+EOL
+
+    # Crear directorio raíz
+    sudo mkdir -p /var/www/html/$server_name
+    
+    # Crear archivo .htaccess básico
+    sudo bash -c "cat > /var/www/html/$server_name/.htaccess" <<EOL
+##
+# @package    Joomla
+# @copyright  (C) 2005 Open Source Matters, Inc. <https://www.joomla.org>
+# @license    GNU General Public License version 2 or later; see LICENSE.txt
+##
+
+# Disable directory browsing
+Options -Indexes
+
+# Disable server signature
+ServerSignature Off
+
+# Protect against certain security vulnerabilities
+<IfModule mod_headers.c>
+    Header set X-Content-Type-Options: nosniff
+    Header set X-XSS-Protection: "1; mode=block"
+    Header set X-Frame-Options: "SAMEORIGIN"
+</IfModule>
+
+# Block access to sensitive directories
+<IfModule mod_rewrite.c>
+    RewriteRule ^(cache|logs|tmp|media|images)/.*\.(php|pl|py|jsp|asp|sh|cgi)$ - [F]
+</IfModule>
+EOL
+    
+    echo -e "${GREEN}✓ Archivo de configuración creado${NC}"
+    
+    # Preguntar si quiere instalar Joomla automáticamente
+    echo ""
+    read -p "¿Descargar e instalar Joomla automáticamente? (s/n): " install_joomla_now
+    
+    if [[ "$install_joomla_now" == "s" || "$install_joomla_now" == "S" ]]; then
+        # Verificar PHP-FPM
+        if ! command -v php-fpm &> /dev/null; then
+            echo -e "${YELLOW}⚠️  Instalando PHP-FPM...${NC}"
+            sudo apt update
+            sudo apt install -y php8.3-fpm php8.3-mysql php8.3-xml php8.3-mbstring php8.3-curl php8.3-zip php8.3-gd php8.3-intl php8.3-imagick
+            sudo systemctl start php8.3-fpm
+            sudo systemctl enable php8.3-fpm
+        fi
+        
+        # Instalar Joomla
+        install_joomla "$server_name"
+        
+        if [ $? -eq 0 ]; then
+            # Crear base de datos
+            echo ""
+            read -p "¿Crear base de datos automáticamente? (s/n): " create_db_now
+            
+            if [[ "$create_db_now" == "s" || "$create_db_now" == "S" ]]; then
+                create_joomla_database "$server_name"
+            fi
+            
+            # Configurar permisos
+            setup_joomla_permissions "$server_name"
+            
+            echo ""
+            echo -e "${GREEN}🎉 ¡Joomla instalado correctamente!${NC}"
+            echo ""
+            echo -e "${WHITE}📝 PRÓXIMOS PASOS:${NC}"
+            echo "  1. Visita: http://$server_name:$port"
+            echo "  2. Sigue el asistente de instalación de Joomla"
+            
+            if [[ "$create_db_now" == "s" || "$create_db_now" == "S" ]]; then
+                echo "  3. Usa estas credenciales en el asistente:"
+                echo -e "     ${CYAN}Base de datos:${NC} $JOOMLA_DB_NAME"
+                echo -e "     ${CYAN}Usuario:${NC} $JOOMLA_DB_USER"
+                echo -e "     ${CYAN}Contraseña:${NC} $JOOMLA_DB_PASS"
+                echo "  4. Las credenciales están guardadas en:"
+                echo -e "     ${YELLOW}/var/www/html/$server_name/db_credentials.txt${NC}"
+            fi
+            
+            echo -e "  5. ${YELLOW}¡IMPORTANTE!${NC} Elimina el archivo de credenciales después de la instalación"
+            echo ""
+            echo -e "${WHITE}🔐 SEGURIDAD:${NC}"
+            echo "  - Después de instalar, revisa los permisos"
+            echo "  - Cambia la contraseña del administrador de Joomla"
+            echo "  - Elimina el archivo db_credentials.txt"
+            echo "  - Configura SSL en Nginx Proxy Manager"
+        fi
+    else
+        echo -e "${YELLOW}ℹ️  Instalación manual:${NC}"
+        echo "  1. Descarga Joomla en: /var/www/html/$server_name"
+        echo "  2. Crea una base de datos para Joomla"
+        echo "  3. Visita: http://$server_name:$port"
+    fi
+    
+    echo -e "${GREEN}✓ Servidor Joomla $server_name creado${NC}"
+}
+
+# Función para crear un nuevo servidor nginx
+create_server() {
+    echo -e "${CYAN}=== CREAR NUEVO SERVIDOR ===${NC}"
+    echo ""
+    
+    read -p "Nombre del server (ej: dve.home.lan): " server_name
+    read -p "Puerto para el server (ej: 8003): " port
+    
+    # Validar que no exista ya
+    if [ -f "/etc/nginx/sites-available/$server_name" ]; then
+        echo -e "${RED}Error: Ya existe un servidor con ese nombre${NC}"
+        return 1
+    fi
+
+    # Preguntar tipo de servidor
+    echo ""
+    echo -e "${WHITE}Selecciona el tipo de servidor:${NC}"
+    echo -e "  ${GREEN}1${NC}) Simple (HTML estático)"
+    echo -e "  ${GREEN}2${NC}) Joomla (PHP + MySQL - Instalación automática)"
+    echo ""
+    read -p "Opción (1/2): " server_type
+    
+    # Solicitar contraseña para sudo
+    sudo -v
+    
+    # Crear según el tipo
+    case "$server_type" in
+        1)
+            create_simple_server "$server_name" "$port"
+            ;;
+        2)
+            create_joomla_server "$server_name" "$port"
+            ;;
+        *)
+            echo -e "${RED}Opción no válida. Creando servidor simple por defecto.${NC}"
+            create_simple_server "$server_name" "$port"
+            ;;
+    esac
+
+    echo ""
+    echo -e "  Configuración: /etc/nginx/sites-available/$server_name"
+    echo -e "  Directorio web: /var/www/html/$server_name"
+
+    # Preguntar si quiere habilitarlo ahora
+    echo ""
+    read -p "¿Habilitar el servidor ahora? (s/n): " enable_now
+    if [[ "$enable_now" == "s" || "$enable_now" == "S" ]]; then
+        enable_server "$server_name" "silent"
+    else
+        echo -e "${YELLOW}Para habilitarlo después: servers -e $server_name${NC}"
+    fi
+    
+    echo ""
+    echo -e "${YELLOW}📌 Próximos pasos:${NC}"
+    echo "  1. Reiniciar nginx: sudo systemctl restart nginx"
+    echo "  2. Configurar en NPManager: https://npm.marx.lan"
+    echo "  3. Crear registro DNS en PiHole: https://pihole.marx.lan"
+    
+    if [[ "$server_type" == "2" ]]; then
+        echo ""
+        echo -e "${YELLOW}📌 Para Joomla:${NC}"
+        echo "  - Visita: http://$server_name:$port"
+        echo "  - Sigue el asistente de instalación"
+        echo "  - Usa las credenciales guardadas en /var/www/html/$server_name/db_credentials.txt"
+        echo "  - ${RED}¡ELIMINA el archivo db_credentials.txt después de la instalación!${NC}"
+    fi
+}
+
+# Función para habilitar un servidor
+enable_server() {
+    local server_name=$1
+    local silent=$2
+    
+    if [ ! -f "/etc/nginx/sites-available/$server_name" ]; then
+        echo -e "${RED}Error: El servidor $server_name no existe${NC}"
+        return 1
+    fi
+    
+    if [ -L "/etc/nginx/sites-enabled/$server_name" ]; then
+        echo -e "${YELLOW}El servidor $server_name ya está habilitado${NC}"
+        return 0
+    fi
+    
+    sudo ln -s "/etc/nginx/sites-available/$server_name" "/etc/nginx/sites-enabled/"
+    
+    if [ "$silent" != "silent" ]; then
+        echo -e "${GREEN}✓ Servidor $server_name habilitado${NC}"
+        echo -e "${YELLOW}Recuerda reiniciar nginx: sudo systemctl restart nginx${NC}"
+    else
+        echo -e "${GREEN}✓ Servidor $server_name habilitado${NC}"
+    fi
+}
+
+# Función para deshabilitar un servidor
+disable_server() {
+    local server_name=$1
+    
+    if [ ! -L "/etc/nginx/sites-enabled/$server_name" ]; then
+        echo -e "${YELLOW}El servidor $server_name ya está deshabilitado o no existe${NC}"
+        return 0
+    fi
+    
+    sudo rm "/etc/nginx/sites-enabled/$server_name"
+    echo -e "${GREEN}✓ Servidor $server_name deshabilitado${NC}"
+    echo -e "${YELLOW}Recuerda reiniciar nginx: sudo systemctl restart nginx${NC}"
+}
+
+# Función para borrar un servidor completamente
+delete_server() {
+    local server_name=$1
+    
+    echo -e "${RED}=== ATENCIÓN: VAS A BORRAR UN SERVIDOR ===${NC}"
+    echo -e "Servidor: ${YELLOW}$server_name${NC}"
+    echo ""
+    echo "Se borrarán:"
+    echo "  - Configuración: /etc/nginx/sites-available/$server_name"
+    echo "  - Enlace simbólico: /etc/nginx/sites-enabled/$server_name (si existe)"
+    echo "  - Directorio web: /var/www/html/$server_name"
+    echo "  - Base de datos asociada (si existe)"
+    echo ""
+    read -p "¿Estás SEGURO? (escribe 'borrar' para confirmar): " confirm
+    
+    if [ "$confirm" != "borrar" ]; then
+        echo -e "${YELLOW}Operación cancelada${NC}"
+        return 0
+    fi
+    
+    # Solicitar contraseña sudo
+    sudo -v
+    
+    # Deshabilitar primero si está habilitado
+    if [ -L "/etc/nginx/sites-enabled/$server_name" ]; then
+        sudo rm "/etc/nginx/sites-enabled/$server_name"
+        echo "  ✓ Enlace simbólico eliminado"
+    fi
+    
+    # Borrar archivo de configuración
+    if [ -f "/etc/nginx/sites-available/$server_name" ]; then
+        sudo rm "/etc/nginx/sites-available/$server_name"
+        echo "  ✓ Configuración eliminada"
+    fi
+    
+    # Preguntar si quiere borrar la base de datos
+    read -p "¿Borrar también la base de datos asociada? (s/n): " delete_db
+    
+    if [[ "$delete_db" == "s" || "$delete_db" == "S" ]]; then
+        local db_name="${server_name%.*}"
+        db_name=$(echo "$db_name" | tr '-' '_' | tr '.' '_')
+        
+        # Obtener contraseña de root
+        get_mysql_root_pass
+        
+        # Eliminar base de datos y usuario
+        mysql -u root -p"$MYSQL_ROOT_PASS" <<EOF
+DROP DATABASE IF EXISTS \`$db_name\`;
+DROP USER IF EXISTS '${db_name}_user'@'localhost';
+FLUSH PRIVILEGES;
+EOF
+        echo "  ✓ Base de datos $db_name eliminada"
+    fi
+    
+    # Borrar directorio web
+    if [ -d "/var/www/html/$server_name" ]; then
+        sudo rm -rf "/var/www/html/$server_name"
+        echo "  ✓ Directorio web eliminado"
+    fi
+    
+    echo -e "${GREEN}✓ Servidor $server_name borrado completamente${NC}"
+    echo -e "${YELLOW}Recuerda reiniciar nginx: sudo systemctl restart nginx${NC}"
+    echo -e "${YELLOW}generar el dominio en NPManager https://npm.marx.lan${NC}"
+    echo -e "${YELLOW}Crear los registros DNS en PiHole https://pihole.marx.lan${NC}"
+}
+
+# Función para listar los servidores disponibles
+list_servers() {
+    echo -e "${CYAN}=== SERVIDORES NGINX DISPONIBLES ===${NC}"
+    echo ""
+    
+    if [ ! -d "/etc/nginx/sites-available" ]; then
+        echo -e "${RED}Error: No se encuentra el directorio /etc/nginx/sites-available${NC}"
+        exit 1
+    fi
+    
+    cd /etc/nginx/sites-available || exit 1
+    
+    # Contar archivos (excluyendo directorios)
+    mapfile -t configs < <(find . -maxdepth 1 -type f -name "*" | sed 's|^\./||' | sort)
+    count=${#configs[@]}
+    
+    if [ "$count" -eq 0 ]; then
+        echo -e "${YELLOW}No hay servidores configurados.${NC}"
+        echo -e "Puedes crear uno con: servers -n"
+    else
+        echo -e "${WHITE}Total: $count servidor(es) encontrado(s)${NC}"
+        echo ""
+        
+        # Listar cada archivo de configuración con información
+        for i in "${!configs[@]}"; do
+            config="${configs[$i]}"
+            
+            # Verificar si está habilitado
+            if [ -L "/etc/nginx/sites-enabled/$config" ]; then
+                enabled="${GREEN}✓ HABILITADO${NC}"
+            else
+                enabled="${RED}✗ DESHABILITADO${NC}"
+            fi
+            
+            # Extraer el puerto
+            port=$(sudo grep -m 1 "listen" "$config" 2>/dev/null | awk '{print $2}' | tr -d ';')
+            port=${port:-"No especificado"}
+            
+            # Verificar si existe el directorio web
+            if [ -d "/var/www/html/$config" ]; then
+                webdir="${GREEN}Existe${NC}"
+            else
+                webdir="${RED}No existe${NC}"
+            fi
+            
+            # Detectar si es Joomla
+            is_joomla=""
+            if [ -f "/var/www/html/$config/administrator/index.php" ] && [ -f "/var/www/html/$config/configuration.php" ]; then
+                is_joomla="${PURPLE}🚀 [JOOMLA]${NC}"
+            elif [ -f "/var/www/html/$config/index.php" ]; then
+                if grep -q "Joomla" "/var/www/html/$config/index.php" 2>/dev/null; then
+                    is_joomla="${PURPLE}🚀 [JOOMLA]${NC}"
+                fi
+            fi
+            
+            echo -e "${WHITE}$((i+1)). $config ${is_joomla}${NC}"
+            echo -e "   ${CYAN}Puerto:${NC} $port"
+            echo -e "   ${CYAN}Estado:${NC} $enabled"
+            echo -e "   ${CYAN}Directorio web:${NC} $webdir"
+            
+            # Mostrar si tiene archivo de credenciales
+            if [ -f "/var/www/html/$config/db_credentials.txt" ]; then
+                echo -e "   ${YELLOW}🔑 Credenciales guardadas${NC}"
+            fi
+            
+            echo ""
+        done
+    fi
+    
+    # Mostrar estadísticas rápidas
+    enabled_count=$(find /etc/nginx/sites-enabled -type l 2>/dev/null | wc -l)
+    echo -e "${WHITE}RESUMEN:${NC}"
+    echo -e "  ${GREEN}Habilitados: $enabled_count${NC}"
+    echo -e "  ${RED}Deshabilitados: $((count - enabled_count))${NC}"
+}
+
+# Función principal que procesa los argumentos
+main() {
+    case "$1" in
+        -h|--help|help)
+            show_help
+            ;;
+        -n|--new)
+            create_server
+            ;;
+        -l|--list)
+            list_servers
+            ;;
+        -e|--enable)
+            if [ -z "$2" ]; then
+                echo -e "${RED}Error: Necesitas especificar el nombre del servidor${NC}"
+                echo -e "Uso: servers -e <nombre_servidor>"
+                exit 1
+            fi
+            enable_server "$2"
+            ;;
+        -d|--disable)
+            if [ -z "$2" ]; then
+                echo -e "${RED}Error: Necesitas especificar el nombre del servidor${NC}"
+                echo -e "Uso: servers -d <nombre_servidor>"
+                exit 1
+            fi
+            disable_server "$2"
+            ;;
+        -rm|--delete|--remove)
+            if [ -z "$2" ]; then
+                echo -e "${RED}Error: Necesitas especificar el nombre del servidor${NC}"
+                echo -e "Uso: servers -rm <nombre_servidor>"
+                exit 1
+            fi
+            delete_server "$2"
+            ;;
+        "")
+            # Sin argumentos: listar servidores
+            list_servers
+            ;;
+        *)
+            echo -e "${RED}Opción no válida: $1${NC}"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+# Ejecutar función principal con todos los argumentos
+main "$@"
