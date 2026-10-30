@@ -1,0 +1,699 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly NGINX_AVAILABLE="/etc/nginx/sites-available"
+readonly NGINX_ENABLED="/etc/nginx/sites-enabled"
+readonly WEB_ROOT="/var/www/html"
+readonly DEFAULT_JOOMLA_VERSION="5.3.0"
+
+MYSQL_ROOT_PASS=""
+
+# ======== Colores ========
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+NC='\033[0m'
+
+log() { printf '%b\n' "$*"; }
+warn() { printf '%b\n' "${YELLOW}[WARN]${NC} $*" >&2; }
+error() { printf '%b\n' "${RED}[ERROR]${NC} $*" >&2; }
+success() { printf '%b\n' "${GREEN}[OK]${NC} $*"; }
+info() { printf '%b\n' "${CYAN}[INFO]${NC} $*"; }
+
+require_root() {
+    if [[ ${EUID} -ne 0 ]]; then
+        error "Este script debe ejecutarse como root o con sudo."
+        exit 1
+    fi
+}
+
+validate_server_name() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || { error "El nombre del servidor no puede estar vacío."; return 1; }
+    [[ "$name" =~ ^[A-Za-z0-9.-]+$ ]] || {
+        error "Nombre inválido: '$name'. Usa solo letras, números, puntos y guiones."
+        return 1
+    }
+}
+
+validate_port() {
+    local port="${1:-}"
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || {
+        error "Puerto inválido: '$port'. Debe estar entre 1 y 65535."
+        return 1
+    }
+}
+
+ensure_nginx_dirs() {
+    install -d -m 755 "$NGINX_AVAILABLE"
+    install -d -m 755 "$NGINX_ENABLED"
+    install -d -m 755 "$WEB_ROOT"
+}
+
+is_port_in_use() {
+    local port="${1:-}"
+
+    # 1) Comprobar listener del host (ss)
+    if command -v ss >/dev/null 2>&1; then
+        if ss -lnt 2>/dev/null | awk 'NR>1 {print $4}' | grep -Eq ":${port}$"; then
+            return 0
+        fi
+    fi
+
+    # 2) Comprobar si lo usa lsof
+    if command -v lsof >/dev/null 2>&1; then
+        if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    # 3) Comprobar contenedores Docker con mappings del host
+    if command -v docker >/dev/null 2>&1; then
+        local ports
+        ports="$(docker ps --format '{{.Ports}}' 2>/dev/null || true)"
+        if [[ -n "$ports" ]]; then
+            while IFS= read -r line; do
+                [[ -n "$line" ]] || continue
+                if [[ "$line" =~ (^|[[:space:]])([0-9]{1,3}(\.[0-9]{1,3}){3}:)?${port}->|(^|[[:space:]])${port}->|(^|[[:space:]])\[::\]:${port}-> ]]; then
+                    return 0
+                fi
+            done <<< "$ports"
+        fi
+    fi
+
+    return 1
+}
+
+port_conflict_message() {
+    local port="${1:-}"
+    warn "El puerto $port ya está en uso en este host o en un contenedor con mapeo de puertos."
+    warn "Comprobado con ss/lsof y Docker (si está instalado)."
+    warn "Nota: si el puerto está ocupado dentro de una VM o contenedor aislado, no se ve desde este host a menos que ese entorno exponga el puerto al host."
+}
+
+show_help() {
+    cat <<'EOF'
+=== SCRIPT DE GESTIÓN DE SERVIDORES NGINX (v2) ===
+
+USO:
+  servers-v2 [OPCIÓN] [NOMBRE_SERVIDOR]
+
+OPCIONES:
+  -n                 Crear un nuevo servidor (modo interactivo)
+  -l                 Listar servidores
+  -e <nombre>        Habilitar un servidor
+  -d <nombre>        Deshabilitar un servidor
+  -rm <nombre>       Borrar un servidor completamente
+  -h                 Mostrar esta ayuda
+
+EJEMPLOS:
+  servers-v2 -l
+  servers-v2 -n
+  servers-v2 -e misitio.com
+  servers-v2 -d misitio.com
+  servers-v2 -rm misitio.com
+EOF
+}
+
+generate_password() {
+    openssl rand -base64 12 | tr -d '=+/' | cut -c1-16
+}
+
+get_mysql_root_pass() {
+    if [[ -z "${MYSQL_ROOT_PASS}" ]]; then
+        printf '%b\n' "${YELLOW}⚠️  Necesito la contraseña de root MySQL${NC}"
+        read -r -s -p "Contraseña de root MySQL: " MYSQL_ROOT_PASS
+        printf '\n'
+    fi
+
+    if ! mysql -u root -p"${MYSQL_ROOT_PASS}" -e "SELECT 1" >/dev/null 2>&1; then
+        error "Contraseña de root MySQL incorrecta."
+        MYSQL_ROOT_PASS=""
+        return 1
+    fi
+
+    return 0
+}
+
+create_simple_server() {
+    local server_name="${1:-}"
+    local port="${2:-}"
+
+    validate_server_name "$server_name"
+    validate_port "$port"
+
+    if [[ -f "$NGINX_AVAILABLE/$server_name" ]]; then
+        error "Ya existe un servidor con ese nombre: $server_name"
+        return 1
+    fi
+
+    if is_port_in_use "$port"; then
+        port_conflict_message "$port"
+        return 1
+    fi
+
+    local web_dir="$WEB_ROOT/$server_name"
+    install -d -m 755 "$web_dir"
+
+    sudo tee "$NGINX_AVAILABLE/$server_name" >/dev/null <<EOF
+server {
+    listen $port;
+    server_name $server_name;
+
+    root $web_dir;
+    index index.html index.htm;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+EOF
+
+    sudo tee "$web_dir/index.html" >/dev/null <<EOF
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="robots" content="noindex,nofollow" />
+  <title>${server_name}</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: linear-gradient(135deg, #111827, #0f172a);
+      color: #22c55e;
+      font-family: "Segoe UI", sans-serif;
+    }
+    h1 {
+      font-size: clamp(1.5rem, 4vw, 3rem);
+      text-transform: uppercase;
+      letter-spacing: .12em;
+      text-shadow: 0 0 12px rgba(34, 197, 94, .9);
+    }
+  </style>
+</head>
+<body>
+  <h1>${server_name}</h1>
+</body>
+</html>
+EOF
+
+    success "Servidor simple $server_name creado correctamente."
+    return 0
+}
+
+create_joomla_database() {
+    local server_name="${1:-}"
+
+    local db_name="${server_name%.*}"
+    db_name="${db_name//-/_}"
+    db_name="${db_name//./_}"
+
+    local db_user="${db_name}_user"
+    local db_password
+    db_password="$(generate_password)"
+
+    if ! get_mysql_root_pass; then
+        return 1
+    fi
+
+    if mysql -u root -p"${MYSQL_ROOT_PASS}" <<EOF
+CREATE DATABASE IF NOT EXISTS \\`$db_name\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$db_user'@'localhost' IDENTIFIED BY '$db_password';
+GRANT ALL PRIVILEGES ON \\`$db_name\\`.* TO '$db_user'@'localhost';
+FLUSH PRIVILEGES;
+EOF
+    then
+        error "Error al crear la base de datos para Joomla."
+        return 1
+    fi
+
+    sudo tee "$WEB_ROOT/$server_name/db_credentials.txt" >/dev/null <<EOF
+==========================================
+CREDENCIALES DE BASE DE DATOS PARA JOOMLA
+==========================================
+Base de datos: $db_name
+Usuario: $db_user
+Contraseña: $db_password
+Host: localhost
+==========================================
+GUARDA ESTAS CREDENCIALES EN UN LUGAR SEGURO
+==========================================
+EOF
+    sudo chmod 600 "$WEB_ROOT/$server_name/db_credentials.txt"
+
+    export JOOMLA_DB_NAME="$db_name"
+    export JOOMLA_DB_USER="$db_user"
+    export JOOMLA_DB_PASS="$db_password"
+
+    success "Base de datos creada: $db_name"
+    success "Usuario creado: $db_user"
+    return 0
+}
+
+install_joomla() {
+    local server_name="${1:-}"
+    local temp_dir="/tmp/joomla_${server_name//[^A-Za-z0-9]/_}"
+    local install_dir="$WEB_ROOT/$server_name"
+
+    [[ -d "$install_dir" ]] || install -d -m 755 "$install_dir"
+
+    rm -rf "$temp_dir"
+    install -d -m 755 "$temp_dir"
+    cd "$temp_dir" || return 1
+
+    local version="${JOOMLA_VERSION:-$DEFAULT_JOOMLA_VERSION}"
+
+    info "Descargando Joomla ${version}..."
+    if ! wget -q "https://downloads.joomla.org/cms/joomla5/${version}/Joomla_${version}-Stable-Full_Package.zip" -O joomla.zip; then
+        warn "No se pudo descargar la versión específica. Descargando la última estable..."
+        if ! wget -q "https://downloads.joomla.org/latest.zip" -O joomla.zip; then
+            error "No se pudo descargar Joomla."
+            return 1
+        fi
+    fi
+
+    if [[ ! -s joomla.zip ]]; then
+        error "El archivo ZIP de Joomla está vacío o no se descargó correctamente."
+        return 1
+    fi
+
+    if ! unzip -q joomla.zip -d "$install_dir"; then
+        error "No se pudo descomprimir Joomla."
+        return 1
+    fi
+
+    rm -rf "$temp_dir"
+    success "Joomla descargado e instalado en $install_dir"
+    return 0
+}
+
+setup_joomla_permissions() {
+    local server_name="${1:-}"
+    local install_dir="$WEB_ROOT/$server_name"
+
+    if [[ ! -d "$install_dir" ]]; then
+        error "El directorio del sitio no existe: $install_dir"
+        return 1
+    fi
+
+    sudo chown -R www-data:www-data "$install_dir"
+    sudo find "$install_dir" -type f -exec chmod 644 {} +
+    sudo find "$install_dir" -type d -exec chmod 755 {} +
+
+    sudo chmod 775 "$install_dir"
+
+    for item in cache logs tmp images media administrator/components administrator/modules administrator/templates; do
+        if [[ -d "$install_dir/$item" ]]; then
+            sudo chmod -R 775 "$install_dir/$item"
+        fi
+    done
+
+    sudo touch "$install_dir/configuration.php"
+    sudo chmod 666 "$install_dir/configuration.php"
+
+    success "Permisos de Joomla configurados."
+    return 0
+}
+
+create_joomla_server() {
+    local server_name="${1:-}"
+    local port="${2:-}"
+
+    validate_server_name "$server_name"
+    validate_port "$port"
+
+    if [[ -f "$NGINX_AVAILABLE/$server_name" ]]; then
+        error "Ya existe un servidor con ese nombre: $server_name"
+        return 1
+    fi
+
+    if is_port_in_use "$port"; then
+        port_conflict_message "$port"
+        return 1
+    fi
+
+    local web_dir="$WEB_ROOT/$server_name"
+    install -d -m 755 "$web_dir"
+
+    sudo tee "$NGINX_AVAILABLE/$server_name" >/dev/null <<EOF
+server {
+    listen $port;
+    server_name $server_name;
+
+    root $web_dir;
+    index index.php index.html index.htm;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$args;
+    }
+
+    location /api/ {
+        try_files \$uri \$uri/ /api/index.php?\$args;
+    }
+
+    location ~* /(images|cache|media|logs|tmp)/.*\.(php|pl|py|jsp|asp|sh|cgi)$ {
+        return 403;
+    }
+
+    location ~ \.php$ {
+        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include /etc/nginx/fastcgi.conf;
+        fastcgi_buffers 16 16k;
+        fastcgi_buffer_size 32k;
+        fastcgi_read_timeout 300;
+    }
+}
+EOF
+
+    sudo tee "$web_dir/.htaccess" >/dev/null <<'EOF'
+Options -Indexes
+ServerSignature Off
+
+<IfModule mod_headers.c>
+    Header set X-Content-Type-Options: nosniff
+    Header set X-XSS-Protection: "1; mode=block"
+    Header set X-Frame-Options: "SAMEORIGIN"
+</IfModule>
+
+<IfModule mod_rewrite.c>
+    RewriteRule ^(cache|logs|tmp|media|images)/.*\.(php|pl|py|jsp|asp|sh|cgi)$ - [F]
+</IfModule>
+EOF
+
+    success "Archivo de configuración NGINX creado para $server_name"
+
+    read -r -p "¿Descargar e instalar Joomla automáticamente? (s/n): " install_joomla_now || true
+    if [[ "$install_joomla_now" =~ ^[sS]$ ]]; then
+        if ! command -v php-fpm >/dev/null 2>&1; then
+            warn "Instalando PHP-FPM y extensiones necesarias..."
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                php8.3-fpm php8.3-mysql php8.3-xml php8.3-mbstring php8.3-curl \
+                php8.3-zip php8.3-gd php8.3-intl php8.3-imagick
+            systemctl start php8.3-fpm || true
+            systemctl enable php8.3-fpm || true
+        fi
+
+        if install_joomla "$server_name"; then
+            read -r -p "¿Crear la base de datos automáticamente? (s/n): " create_db_now || true
+            if [[ "$create_db_now" =~ ^[sS]$ ]]; then
+                create_joomla_database "$server_name" || return 1
+            fi
+
+            setup_joomla_permissions "$server_name" || return 1
+
+            printf '\n'
+            success "🎉 Joomla preparado correctamente."
+            printf '%b\n' "${WHITE}Próximos pasos:${NC}"
+            printf '%b\n' "  1. Visita: http://$server_name:$port"
+            printf '%b\n' "  2. Completa el asistente de instalación de Joomla"
+
+            if [[ "$create_db_now" =~ ^[sS]$ ]]; then
+                printf '%b\n' "  3. Base de datos: ${CYAN}${JOOMLA_DB_NAME:-N/A}${NC}"
+                printf '%b\n' "  4. Usuario: ${CYAN}${JOOMLA_DB_USER:-N/A}${NC}"
+                printf '%b\n' "  5. Contraseña: ${CYAN}${JOOMLA_DB_PASS:-N/A}${NC}"
+                printf '%b\n' "  6. Credenciales guardadas en: ${YELLOW}/var/www/html/$server_name/db_credentials.txt${NC}"
+            fi
+
+            printf '%b\n' "  7. ${RED}IMPORTANTE:${NC} Elimina db_credentials.txt después de la instalación."
+        fi
+    else
+        warn "Instalación manual seleccionada."
+        warn "1) Descarga Joomla en: $web_dir"
+        warn "2) Crea la base de datos para Joomla"
+        warn "3) Visita: http://$server_name:$port"
+    fi
+
+    return 0
+}
+
+create_server() {
+    info "=== CREAR NUEVO SERVIDOR ==="
+
+    local server_name port server_type
+
+    read -r -p "Nombre del servidor (ej: app.home.lan): " server_name || true
+    read -r -p "Puerto (ej: 8003): " port || true
+
+    validate_server_name "$server_name" || return 1
+    validate_port "$port" || return 1
+
+    printf '\n'
+    printf '%b\n' "${WHITE}Selecciona el tipo de servidor:${NC}"
+    printf '%b\n' "  ${GREEN}1${NC}) Simple (HTML estático)"
+    printf '%b\n' "  ${GREEN}2${NC}) Joomla (PHP + MySQL)"
+    read -r -p "Opción (1/2): " server_type || true
+
+    case "$server_type" in
+        1)
+            create_simple_server "$server_name" "$port"
+            ;;
+        2)
+            create_joomla_server "$server_name" "$port"
+            ;;
+        *)
+            warn "Opción no válida. Creando servidor simple por defecto."
+            create_simple_server "$server_name" "$port"
+            ;;
+    esac
+
+    local enable_now=""
+    read -r -p "¿Habilitar el servidor ahora? (s/n): " enable_now || true
+    if [[ "$enable_now" =~ ^[sS]$ ]]; then
+        enable_server "$server_name" "silent" || true
+    else
+        warn "Para habilitarlo después: servers-v2 -e $server_name"
+    fi
+
+    printf '\n'
+    info "Próximos pasos:"
+    printf '%b\n' "  1. Reiniciar nginx: sudo systemctl restart nginx"
+    printf '%b\n' "  2. Configurar Nginx Proxy Manager: https://npm.marx.lan"
+    printf '%b\n' "  3. Crear registro DNS en Pi-hole: https://pihole.marx.lan"
+}
+
+enable_server() {
+    local server_name="${1:-}"
+    local silent="${2:-}"
+
+    validate_server_name "$server_name" || return 1
+
+    if [[ ! -f "$NGINX_AVAILABLE/$server_name" ]]; then
+        error "El servidor $server_name no existe."
+        return 1
+    fi
+
+    if [[ -L "$NGINX_ENABLED/$server_name" ]]; then
+        warn "El servidor $server_name ya está habilitado."
+        return 0
+    fi
+
+    sudo ln -s "$NGINX_AVAILABLE/$server_name" "$NGINX_ENABLED/"
+
+    if [[ "$silent" != "silent" ]]; then
+        success "Servidor $server_name habilitado."
+        warn "Recuerda reiniciar nginx: sudo systemctl restart nginx"
+    else
+        success "Servidor $server_name habilitado."
+    fi
+
+    return 0
+}
+
+disable_server() {
+    local server_name="${1:-}"
+    validate_server_name "$server_name" || return 1
+
+    if [[ ! -L "$NGINX_ENABLED/$server_name" ]]; then
+        warn "El servidor $server_name ya está deshabilitado o no existe."
+        return 0
+    fi
+
+    sudo rm -f "$NGINX_ENABLED/$server_name"
+    success "Servidor $server_name deshabilitado."
+    warn "Recuerda reiniciar nginx: sudo systemctl restart nginx"
+}
+
+delete_server() {
+    local server_name="${1:-}"
+    local confirm="${2:-}"
+
+    validate_server_name "$server_name" || return 1
+
+    printf '%b\n' "${RED}=== ATENCIÓN: VAS A BORRAR UN SERVIDOR ===${NC}"
+    printf '%b\n' "Servidor: ${YELLOW}$server_name${NC}"
+    printf '\n'
+    printf '%b\n' "Se borrarán:"
+    printf '%b\n' "  - Configuración: $NGINX_AVAILABLE/$server_name"
+    printf '%b\n' "  - Enlace simbólico: $NGINX_ENABLED/$server_name (si existe)"
+    printf '%b\n' "  - Directorio web: $WEB_ROOT/$server_name"
+    printf '%b\n' "  - Base de datos asociada (si existe)"
+    printf '\n'
+
+    if [[ "$confirm" != "--force" ]]; then
+        read -r -p "¿Estás SEGURO? (escribe 'borrar' para confirmar): " confirm || true
+        if [[ "$confirm" != "borrar" ]]; then
+            warn "Operación cancelada."
+            return 0
+        fi
+    fi
+
+    sudo -v
+
+    if [[ -L "$NGINX_ENABLED/$server_name" ]]; then
+        sudo rm -f "$NGINX_ENABLED/$server_name"
+        success "Enlace simbólico eliminado."
+    fi
+
+    if [[ -f "$NGINX_AVAILABLE/$server_name" ]]; then
+        sudo rm -f "$NGINX_AVAILABLE/$server_name"
+        success "Configuración eliminada."
+    fi
+
+    local delete_db=""
+    read -r -p "¿Borrar también la base de datos asociada? (s/n): " delete_db || true
+    if [[ "$delete_db" =~ ^[sS]$ ]]; then
+        local db_name="${server_name%.*}"
+        db_name="${db_name//-/_}"
+        db_name="${db_name//./_}"
+
+        if get_mysql_root_pass; then
+            mysql -u root -p"${MYSQL_ROOT_PASS}" <<EOF
+DROP DATABASE IF EXISTS \`$db_name\`;
+DROP USER IF EXISTS '${db_name}_user'@'localhost';
+FLUSH PRIVILEGES;
+EOF
+            success "Base de datos $db_name eliminada."
+        fi
+    fi
+
+    if [[ -d "$WEB_ROOT/$server_name" ]]; then
+        sudo rm -rf "$WEB_ROOT/$server_name"
+        success "Directorio web eliminado."
+    fi
+
+    success "Servidor $server_name borrado completamente."
+    warn "Recuerda reiniciar nginx: sudo systemctl restart nginx"
+    warn "Genera el dominio en Nginx Proxy Manager: https://npm.marx.lan"
+    warn "Crea los registros DNS en Pi-hole: https://pihole.marx.lan"
+}
+
+list_servers() {
+    info "=== SERVIDORES NGINX DISPONIBLES ==="
+    printf '\n'
+
+    if [[ ! -d "$NGINX_AVAILABLE" ]]; then
+        error "No se encuentra $NGINX_AVAILABLE"
+        exit 1
+    fi
+
+    local configs=()
+    while IFS= read -r file; do
+        configs+=("$file")
+    done < <(find "$NGINX_AVAILABLE" -maxdepth 1 -type f -printf '%f\n' | sort)
+
+    if ((${#configs[@]} == 0)); then
+        warn "No hay servidores configurados."
+        warn "Puedes crear uno con: servers-v2 -n"
+        return 0
+    fi
+
+    printf '%b\n' "${WHITE}Total: ${#configs[@]} servidor(es) encontrado(s)${NC}"
+    printf '\n'
+
+    local config enabled port webdir is_joomla
+    for i in "${!configs[@]}"; do
+        config="${configs[$i]}"
+
+        if [[ -L "$NGINX_ENABLED/$config" ]]; then
+            enabled="${GREEN}✓ HABILITADO${NC}"
+        else
+            enabled="${RED}✗ DESHABILITADO${NC}"
+        fi
+
+        port=$(sudo grep -m 1 "listen" "$NGINX_AVAILABLE/$config" 2>/dev/null | awk '{print $2}' | tr -d ';' || true)
+        port="${port:-No especificado}"
+
+        if [[ -d "$WEB_ROOT/$config" ]]; then
+            webdir="${GREEN}Existe${NC}"
+        else
+            webdir="${RED}No existe${NC}"
+        fi
+
+        is_joomla=""
+        if [[ -f "$WEB_ROOT/$config/administrator/index.php" && -f "$WEB_ROOT/$config/configuration.php" ]]; then
+            is_joomla="${PURPLE}🚀 [JOOMLA]${NC}"
+        elif [[ -f "$WEB_ROOT/$config/index.php" ]]; then
+            if grep -q "Joomla" "$WEB_ROOT/$config/index.php" 2>/dev/null; then
+                is_joomla="${PURPLE}🚀 [JOOMLA]${NC}"
+            fi
+        fi
+
+        printf '%b\n' "${WHITE}$((i+1)). $config ${is_joomla}${NC}"
+        printf '%b\n' "   ${CYAN}Puerto:${NC} $port"
+        printf '%b\n' "   ${CYAN}Estado:${NC} $enabled"
+        printf '%b\n' "   ${CYAN}Directorio web:${NC} $webdir"
+
+        if [[ -f "$WEB_ROOT/$config/db_credentials.txt" ]]; then
+            printf '%b\n' "   ${YELLOW}🔑 Credenciales guardadas${NC}"
+        fi
+
+        printf '\n'
+    done
+
+    local enabled_count
+    enabled_count=$(find "$NGINX_ENABLED" -type l 2>/dev/null | wc -l)
+    printf '%b\n' "${WHITE}RESUMEN:${NC}"
+    printf '%b\n' "  ${GREEN}Habilitados: $enabled_count${NC}"
+    printf '%b\n' "  ${RED}Deshabilitados: $(( ${#configs[@]} - enabled_count ))${NC}"
+}
+
+main() {
+    require_root
+    ensure_nginx_dirs
+
+    case "${1:-}" in
+        -h|--help|help)
+            show_help
+            ;;
+        -n|--new)
+            create_server
+            ;;
+        -l|--list)
+            list_servers
+            ;;
+        -e|--enable)
+            [[ -n "${2:-}" ]] || { error "Debes especificar el nombre del servidor."; exit 1; }
+            enable_server "$2"
+            ;;
+        -d|--disable)
+            [[ -n "${2:-}" ]] || { error "Debes especificar el nombre del servidor."; exit 1; }
+            disable_server "$2"
+            ;;
+        -rm|--delete|--remove)
+            [[ -n "${2:-}" ]] || { error "Debes especificar el nombre del servidor."; exit 1; }
+            delete_server "$2" "${3:-}"
+            ;;
+        "")
+            list_servers
+            ;;
+        *)
+            error "Opción no válida: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
