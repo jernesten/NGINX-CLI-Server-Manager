@@ -1,93 +1,161 @@
 # NGINX CLI Server Manager
 
-Una herramienta de línea de comandos para gestionar y provisionar nuevos servidores virtuales con NGINX.
+Script para gestionar servidores virtuales en NGINX desde la terminal.
 
 ## Descripción
 
-Este proyecto ayuda a automatizar la creación y configuración de entornos de servidores web desde la terminal. Está pensado para desarrolladores y administradores que desean crear y administrar instancias de NGINX de forma rápida y reproducible.
+Este proyecto permite crear, habilitar, deshabilitar y eliminar configuraciones de sitios web en NGINX de forma automática. Está pensado para entornos locales o de laboratorio donde se necesita crear servidores virtuales rápidamente sin depender de un panel visual.
+
+La herramienta trabaja con archivos de configuración en `/etc/nginx/sites-available`, crea directorios web en `/var/www/html`, y puede gestionar tanto sitios estáticos como instalaciones de Joomla con base de datos MySQL.
+
+## Qué hace realmente
+
+El repositorio incluye dos versiones del script:
+
+- `servers`: versión original, con gestión básica de sitios NGINX y soporte para Joomla.
+- `servers-v2`: versión mejorada, con validación de entrada, comprobación de puertos, manejo más seguro de errores y estructura más ordenada.
 
 ## Funcionalidades
 
-- Crear nuevos servidores virtuales
-- Configurar servicios relacionados con NGINX
-- Gestionar tareas del servidor desde la terminal
-- Automatizar procesos del entorno
-- Interfaz ligera y compatible con scripts
+- Crear servidores virtuales de NGINX
+- Configurar sitios con `listen` y `server_name`
+- Crear directorios web para cada dominio o nombre de servidor
+- Habilitar y deshabilitar sitios en `sites-enabled`
+- Eliminar servidores y limpiar configuración asociada
+- Listar servidores existentes con puerto, estado y directorio web
+- Soporte para sitios HTML estáticos
+- Soporte para Joomla con:
+  - descarga e instalación automática
+  - creación de base de datos MySQL
+  - generación de credenciales de acceso
+  - configuración de permisos para PHP/FPM
+- Validación de nombre de servidor y puertos
+- Detección de conflictos de puertos usando `ss`, `lsof` y Docker
 
 ## Requisitos
 
-Antes de usar este proyecto, asegúrate de tener instalado:
+Antes de usarlo, asegúrate de tener:
 
-- Linux o un sistema Unix similar
-- NGINX
-- Permisos de administrador o sudo, si es necesario
-- Acceso a la terminal del sistema
-
-## Instalación
-
-Clona el repositorio:
-
-```bash
-git clone https://github.com/jernesten/NGINX-CLI-Server-Manager.git
-cd NGINX-CLI-Server-Manager
-```
-
-Si tu proyecto usa dependencias, instálalas con:
-
-```bash
-npm install
-```
-
-Si el proyecto es un script de shell o Python, usa el comando correspondiente según el stack del repositorio.
+- Linux o un sistema tipo Unix
+- NGINX instalado
+- MySQL/MariaDB si vas a crear sitios Joomla
+- PHP-FPM para instalaciones de Joomla
+- Permisos de administrador o `sudo`
+- Acceso a la terminal
 
 ## Uso
 
-Ejecuta el comando principal:
+### Ver ayuda
 
 ```bash
-./server-manager
+./servers -h
 ```
-
-Si el proyecto es una CLI en Node.js, probablemente se ejecute así:
 
 ```bash
-node index.js
+./servers-v2 -h
 ```
 
-Puedes consultar las opciones disponibles con:
+### Listar servidores
 
 ```bash
-./server-manager --help
+./servers
 ```
-
-## Ejemplo
 
 ```bash
-./server-manager create --name example.com --domain example.com
+./servers-v2 -l
 ```
 
-Este ejemplo crea una nueva configuración de servidor virtual para el dominio indicado.
+### Crear un nuevo servidor
 
-## Configuración
+```bash
+./servers -n
+```
 
-Ajusta la configuración del proyecto según tu entorno local, por ejemplo:
+```bash
+./servers-v2 -n
+```
+
+El script te pedirá:
 
 - nombre del servidor
-- dominio
 - puerto
-- ruta de configuración de NGINX
-- ubicación de logs
+- tipo de servidor:
+  - simple (HTML estático)
+  - Joomla (PHP + MySQL)
 
-## Solución de problemas
+### Habilitar un servidor
 
-- Verifica que NGINX esté instalado y ejecutándose
-- Comprueba permisos de archivos y carpetas
-- Revisa la sintaxis de la configuración
-- Ejecuta comandos con sudo si se requieren cambios de sistema
+```bash
+./servers -e ejemplo.local
+./servers-v2 -e ejemplo.local
+```
 
-## Contribuciones
+### Deshabilitar un servidor
 
-Las contribuciones son bienvenidas. Puedes abrir un issue o enviar un pull request con mejoras.
+```bash
+./servers -d ejemplo.local
+./servers-v2 -d ejemplo.local
+```
+
+### Eliminar un servidor
+
+```bash
+./servers -rm ejemplo.local
+./servers-v2 -rm ejemplo.local
+```
+
+## Estructura que crea el script
+
+Los sitios se generan normalmente así:
+
+- Configuración NGINX: `/etc/nginx/sites-available/<nombre>`
+- Enlace habilitado: `/etc/nginx/sites-enabled/<nombre>`
+- Directorio web: `/var/www/html/<nombre>`
+
+## Tipo de servidor: simple
+
+Crea un sitio estático con una plantilla HTML básica y un bloque NGINX similar a este:
+
+```nginx
+server {
+    listen 8003;
+    server_name ejemplo.local;
+
+    root /var/www/html/ejemplo.local;
+    index index.html index.htm;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+```
+
+## Tipo de servidor: Joomla
+
+Si eliges Joomla, el script puede:
+
+- crear una base de datos en MySQL
+- crear el usuario correspondiente
+- generar credenciales en `/var/www/html/<nombre>/db_credentials.txt`
+- descargar Joomla
+- preparar permisos para PHP y NGINX
+- dejarte listo para completar la instalación desde el navegador
+
+## Recomendaciones
+
+- Reinicia NGINX después de habilitar o eliminar sitios:
+
+```bash
+sudo systemctl restart nginx
+```
+
+- Guarda las credenciales de Joomla en un lugar seguro y elimínalas después de la instalación.
+- Usa nombres de servidor consistentes y puertos libres.
+- Si se usa un entorno con Docker, revisa si el puerto está ocupado por un contenedor.
+
+## Notas
+
+Este proyecto está orientado a administración local y automatización de despliegues simples. No reemplaza un entorno de producción completo, pero sí facilita la creación y gestión rápida de sitios web en un servidor Linux con NGINX.
 
 ## Licencia
 
